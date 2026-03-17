@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# data files
+*.csv
+*.parquet
+*.xlsx
+*.xls
+
+# jupyter
+.ipynb_checkpoints/
+
+# env
+.env
