@@ -1,6 +1,3 @@
-# ── I/O defaults ──────────────────────────────────────────────────────────────
-default_output_csv: "provider_level.csv"
-
 # ── Data filtering ────────────────────────────────────────────────────────────
 # Only months on or before this date are used.
 date_cutoff: "2024-12-31"

@@ -1,6 +1,7 @@
 """Build provider-level anomaly detection feature table from a provider-month CSV."""
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -24,7 +25,8 @@ def _load_config(path: Path = _CONFIG_PATH) -> dict:
 
 _cfg = _load_config()
 
-DEFAULT_OUTPUT_CSV     = _cfg["default_output_csv"]
+DEFAULT_OUTPUT_CSV     = "provider_level.csv"
+DEFAULT_DICTIONARY_CSV = "provider_level_data_dictionary.csv"
 MIN_MONTHS_DEFAULT     = _cfg["min_months_default"]
 DATE_CUTOFF            = _cfg["date_cutoff"]
 ROBUST_Z_WINDOW        = _cfg["robust_z_window"]
@@ -415,6 +417,26 @@ def build_provider_level(df: pd.DataFrame, min_months: int = MIN_MONTHS_DEFAULT)
     return pd.DataFrame(rows).reset_index(drop=True)
 
 
+# ── Data dictionary ───────────────────────────────────────────────────────────
+_DICT_SOURCE = Path(__file__).parent / "provider_level_data_dictionary.json"
+
+
+def build_data_dictionary(df: pd.DataFrame, source: Path = _DICT_SOURCE) -> list[dict]:
+    """Load dictionary from JSON, validate against df columns, return in df column order."""
+    with open(source, encoding="utf-8") as f:
+        entries = json.load(f)
+    dict_cols   = {e["column_name"] for e in entries}
+    actual_cols = set(df.columns)
+    missing_in_dict = actual_cols - dict_cols
+    extra_in_dict   = dict_cols - actual_cols
+    if missing_in_dict:
+        raise ValueError(f"Data dictionary missing entries for columns: {missing_in_dict}")
+    if extra_in_dict:
+        raise ValueError(f"Data dictionary has entries for columns not in output: {extra_in_dict}")
+    col_order = {col: i for i, col in enumerate(df.columns)}
+    return sorted(entries, key=lambda e: col_order[e["column_name"]])
+
+
 # ── I/O ────────────────────────────────────────────────────────────────────────
 def load_provider_month(path: str) -> pd.DataFrame:
     p = Path(path)
@@ -431,11 +453,15 @@ def load_provider_month(path: str) -> pd.DataFrame:
 def run(
     input_csv: str,
     output_csv: str = DEFAULT_OUTPUT_CSV,
+    dictionary_csv: str = DEFAULT_DICTIONARY_CSV,
+    dictionary_json: Path = _DICT_SOURCE,
     min_months: int = MIN_MONTHS_DEFAULT,
     date_cutoff: str = DATE_CUTOFF,
     filter_output: bool = True,
 ) -> pd.DataFrame:
-    """Build features for ALL providers, then optionally filter output to months_active >= min_months."""
+    """Build features for ALL providers, then optionally filter output to months_active >= min_months.
+    Saves the provider-level CSV and a human-readable data dictionary CSV.
+    """
     if not RUPTURES_AVAILABLE:
         print("Warning: ruptures not installed — changepoint features will be NaN.\n"
               "Install with: pip install ruptures", file=sys.stderr)
@@ -458,9 +484,21 @@ def run(
         provider_level = provider_level[provider_level["insufficient_history_flag"] == 0].copy()
         print(f"After output filter: {len(provider_level):,} providers retained.")
 
+    # Save CSV
     out_path = Path(output_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     provider_level.to_csv(out_path, index=False)
+    print(f"Output CSV:       {out_path.resolve()}")
+
+    # Save data dictionary CSV (JSON source lives statically in scripts/)
+    data_dict = build_data_dictionary(provider_level, source=Path(dictionary_json))
+    csv_path = Path(dictionary_csv)
+    if not csv_path.is_absolute():
+        csv_path = out_path.parent / csv_path
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(data_dict).to_csv(csv_path, index=False)
+    print(f"Dictionary CSV:   {csv_path.resolve()}")
+
     return provider_level
 
 
@@ -471,6 +509,10 @@ def main():
     parser.add_argument("input_csv", help="Path to provider-month CSV.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_CSV,
                         help=f"Output CSV path (default: {DEFAULT_OUTPUT_CSV}).")
+    parser.add_argument("--dictionary-csv", default=DEFAULT_DICTIONARY_CSV,
+                        help=f"Output path for data dictionary CSV (default: {DEFAULT_DICTIONARY_CSV}).")
+    parser.add_argument("--dictionary-json", default=str(_DICT_SOURCE),
+                        help=f"Path to data dictionary JSON source (default: {_DICT_SOURCE}).")
     parser.add_argument("--min-months", type=int, default=MIN_MONTHS_DEFAULT,
                         help=f"Threshold for insufficient_history_flag (default: {MIN_MONTHS_DEFAULT}).")
     parser.add_argument("--date-cutoff", default=DATE_CUTOFF,
@@ -480,7 +522,8 @@ def main():
     args = parser.parse_args()
 
     provider_level = run(
-        args.input_csv, args.output, args.min_months, args.date_cutoff,
+        args.input_csv, args.output, args.dictionary_csv, args.dictionary_json,
+        args.min_months, args.date_cutoff,
         filter_output=not args.no_filter,
     )
 
