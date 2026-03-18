@@ -8,7 +8,7 @@ RAW_CSV="$REPO/data/datasets/medicaid-provider-spending.csv"
 COHORT_CSV="$REPO/data/outputs/provider_cohorts.csv"
 OUTPUT_CSV="$REPO/data/outputs/provider_month_NM_organization.csv"
 DICTIONARY_CSV="$REPO/data/outputs/provider_month_data_dictionary.csv"
-DICTIONARY_JSON="$REPO/scripts/provider_month_data_dictionary.json"
+DICTIONARY_JSON="$REPO/provider_month_data_dictionary.json"
 
 python "$REPO/scripts/create_provider_month_dataset.py" "$RAW_CSV" \
   --cohort-csv "$COHORT_CSV" \

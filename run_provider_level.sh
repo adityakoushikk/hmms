@@ -7,7 +7,7 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 INPUT_CSV="$REPO/data/outputs/provider_month_NM_organization.csv"
 OUTPUT_CSV="$REPO/data/outputs/provider_level.csv"
 DICTIONARY_CSV="$REPO/data/outputs/provider_level_data_dictionary.csv"
-DICTIONARY_JSON="$REPO/scripts/provider_level_data_dictionary.json"
+DICTIONARY_JSON="$REPO/provider_level_data_dictionary.json"
 
 python "$REPO/scripts/create_provider_level_from_month.py" "$INPUT_CSV" \
   --output "$OUTPUT_CSV" \
