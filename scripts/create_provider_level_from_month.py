@@ -1,4 +1,17 @@
-"""Build provider-level anomaly detection feature table from a provider-month CSV."""
+"""Build provider-level anomaly detection feature table from a provider-month CSV.
+
+Design: column-driven, family-driven.
+    provider-level features = (numeric monthly column) × (reusable feature family)
+
+Each feature family is a pure function:
+    (col, values, [gaps,] [cfg]) → flat dict of feature_name → value
+
+The main loop applies each eligible family to every numeric monthly column present
+in the input.  Adding a new monthly signal requires only adding it to one of the
+eligibility sets below — no new logic blocks.
+
+Key tuning knobs live in config.yaml under provider_level_features.
+"""
 
 import argparse
 import json
@@ -16,63 +29,92 @@ try:
 except ImportError:
     RUPTURES_AVAILABLE = False
 
-# ── CONFIG — loaded from config.yaml next to this script ──────────────────────
+
+# ── Config ─────────────────────────────────────────────────────────────────────
 _CONFIG_PATH = Path(__file__).parent / "config.yaml"
+
 
 def _load_config(path: Path = _CONFIG_PATH) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
-_cfg = _load_config()
+
+_cfg_root = _load_config()
+_cfg      = _cfg_root["provider_level_features"]
 
 DEFAULT_OUTPUT_CSV     = "provider_level.csv"
 DEFAULT_DICTIONARY_CSV = "provider_level_data_dictionary.csv"
-MIN_MONTHS_DEFAULT     = _cfg["min_months_default"]
-DATE_CUTOFF            = _cfg["date_cutoff"]
-ROBUST_Z_WINDOW        = _cfg["robust_z_window"]
-ROBUST_Z_THRESHOLD     = _cfg["robust_z_threshold"]
-FLAG_RECENT_MONTHS     = _cfg["flag_recent_months"]
-MOM_MIN_DENOMINATOR    = _cfg["mom_min_denominator"]
-HIGH_ENTROPY_CHANGE    = _cfg["high_entropy_change"]
-HIGH_HHI_CHANGE        = _cfg["high_hhi_change"]
-HIGH_CONCENTRATION_HHI = _cfg["high_concentration_hhi"]
-TOP3_HIGH_THRESHOLD    = _cfg["top3_high_threshold"]
-CHANGEPOINT_PENALTY    = _cfg["changepoint_penalty"]
-CHANGEPOINT_MODEL      = _cfg["changepoint_model"]
-CHANGEPOINT_MIN_SIZE   = _cfg["changepoint_min_size"]
-CHANGEPOINT_MIN_OBS    = _cfg["changepoint_min_obs"]
+DATE_CUTOFF            = _cfg_root["date_cutoff"]
+MIN_MONTHS_DEFAULT     = _cfg["min_months_observed"]
+
+
+# ── Column eligibility ─────────────────────────────────────────────────────────
+# All numeric monthly columns to process, in output order.
+# Columns absent from the input CSV are silently skipped (null blocks emitted).
+_GROUP_A = ["paid_t", "claims_t", "hcpcs_count_t", "beneficiaries_proxy_t"]
+_GROUP_B = ["paid_per_claim_t", "claims_per_beneficiary_proxy_t", "paid_per_beneficiary_proxy_t"]
+_GROUP_C = ["top_code_paid_share", "top_3_code_paid_share", "hcpcs_entropy", "hcpcs_hhi"]
+_GROUP_D = ["top_code_claim_share_t", "top_3_code_claim_share_t",
+            "hcpcs_claim_entropy_t", "hcpcs_claim_hhi_t"]
+_GROUP_E = ["top_code_beneficiary_share_t", "top_3_code_beneficiary_share_t",
+            "hcpcs_beneficiary_entropy_t", "hcpcs_beneficiary_hhi_t"]
+_GROUP_F = ["top_code_paid_minus_claim_share_t", "top_code_paid_minus_beneficiary_share_t",
+            "hcpcs_paid_hhi_minus_claim_hhi_t"]
+
+ALL_NUMERIC_COLUMNS: list[str] = _GROUP_A + _GROUP_B + _GROUP_C + _GROUP_D + _GROUP_E + _GROUP_F
+
+# x_sum only for columns where summing across months is meaningful
+ADDITIVE_COLUMNS: frozenset[str] = frozenset(_GROUP_A)
+
+# Percent-growth only for positive-valued, non-bounded signals
+PCT_GROWTH_COLUMNS: frozenset[str] = frozenset(_GROUP_A + _GROUP_B)
+
+# Ratio spike features (max/median, max/mean) are suppressed for signed columns
+SIGNED_OR_MISMATCH_COLUMNS: frozenset[str] = frozenset(_GROUP_F)
+
+# Hardcoded per-family minimum obs (not in config — not worth tuning)
+_MIN_OBS_SUMMARY    = 1
+_MIN_OBS_CHANGE     = 2   # diffs, spikes, pct_growth
+_MIN_OBS_SLOPE      = 3   # linregress needs ≥ 3 distinct points
+# changepoints: governed by cfg["changepoints"]["min_obs"]
+
+# Numerical floors (hardcoded — stable, no need to tune)
+_RATIO_FLOOR   = 1e-8
+_CV_MEAN_FLOOR = 1e-8
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _gap_months(months: pd.Series) -> np.ndarray:
     """Calendar-month gaps between consecutive observed months.
     Uses datetime64[M] arithmetic; exact regardless of day-of-month.
-    Example: [Jan-2023, Apr-2023, May-2023] → [3, 1]
+    E.g. [Jan-2023, Apr-2023, May-2023] → [3, 1]
     """
     m = months.to_numpy(dtype="datetime64[M]").astype(int)
     return np.diff(m).astype(float)
 
 
-def _valid_obs_with_gaps(prov: pd.DataFrame, col: str = "paid_t") -> tuple[np.ndarray, np.ndarray]:
-    """Non-NaN values of `col` (sorted by month) and their inter-observation calendar gaps."""
-    mask = ~prov[col].isna()
+def _valid_obs_with_gaps(prov: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray]:
+    """Non-NaN values of `col` sorted by month, and inter-observation calendar gaps."""
+    mask  = prov[col].notna()
     valid = prov[mask].sort_values("month")
     values = valid[col].to_numpy(dtype=float)
-    gaps = _gap_months(valid["month"]) if len(values) > 1 else np.array([], dtype=float)
+    gaps   = _gap_months(valid["month"]) if len(values) > 1 else np.array([], dtype=float)
     return values, gaps
 
 
+def _safe_gaps(gaps: np.ndarray) -> np.ndarray:
+    """Clamp to ≥ 1.0 to prevent divide-by-zero."""
+    return np.where(gaps <= 0, 1.0, gaps)
+
+
 def _mad(x: np.ndarray) -> float:
-    """Median absolute deviation (NaN-safe)."""
-    x = x[~np.isnan(x)]
     if len(x) == 0:
         return np.nan
     return float(np.median(np.abs(x - np.median(x))))
 
 
 def _rolling_robust_z(series: pd.Series, window: int) -> pd.Series:
-    """Robust z-score of each row against the prior `window` OBSERVED rows (no look-ahead).
-    Baseline is prior-N-observed-rows, NOT prior-N-calendar-months.
+    """Robust z of each row against prior `window` OBSERVED rows (no look-ahead).
     Returns NaN until a full window is available.
     """
     values = series.to_numpy(dtype=float)
@@ -87,193 +129,213 @@ def _rolling_robust_z(series: pd.Series, window: int) -> pd.Series:
     return pd.Series(result, index=series.index)
 
 
-def _linear_slope(x: np.ndarray) -> float:
-    """OLS slope per observed step (not per calendar month — spacing is irregular)."""
-    x = x[~np.isnan(x)]
-    if len(x) < 2:
-        return np.nan
-    slope, *_ = stats.linregress(np.arange(len(x), dtype=float), x)
-    return float(slope)
+# ── Feature families ───────────────────────────────────────────────────────────
 
-
-def _nan_safe_frac(arr: np.ndarray, condition: np.ndarray) -> float:
-    """Fraction of non-NaN entries satisfying `condition`.
-    Excludes NaN positions from both numerator and denominator.
-    """
-    valid = ~np.isnan(arr)
-    if not valid.any():
-        return np.nan
-    return float(np.mean(condition[valid]))
-
-
-# ── Feature groups ─────────────────────────────────────────────────────────────
-def _has_valid(arr: np.ndarray) -> bool:
-    """True if arr has at least one non-NaN value."""
-    return bool(np.any(~np.isnan(arr)))
-
-
-def compute_volume_scale_features(prov: pd.DataFrame) -> dict:
-    paid = prov["paid_t"].to_numpy(dtype=float)
-    v = _has_valid(paid)
-    return {
-        "months_active": int(prov["month"].nunique()),
-        "sum_paid":      float(np.nansum(paid)),
-        "mean_paid":     float(np.nanmean(paid))   if v else np.nan,
-        "median_paid":   float(np.nanmedian(paid)) if v else np.nan,
-        "max_paid":      float(np.nanmax(paid))    if v else np.nan,
-    }
-
-
-def compute_unit_economics_features(prov: pd.DataFrame) -> dict:
-    """Paid-per-claim summaries.
-    claim_weighted_paid_per_claim = sum(paid_t)/sum(claims_t); more robust than
-    the unweighted mean because high-volume months contribute proportionally.
-    """
-    ppc = prov["paid_per_claim_t"].to_numpy(dtype=float)
-
-    if "claims_t" in prov.columns:
-        valid = prov["claims_t"] > 0
-        cwppc = float(prov.loc[valid, "paid_t"].sum() / prov.loc[valid, "claims_t"].sum()) if valid.any() else np.nan
-    else:
-        cwppc = np.nan
-
-    return {
-        "mean_paid_per_claim":           float(np.nanmean(ppc))        if len(ppc) else np.nan,
-        "median_paid_per_claim":         float(np.nanmedian(ppc))      if len(ppc) else np.nan,
-        "std_paid_per_claim":            float(np.nanstd(ppc, ddof=1)) if len(ppc) > 1 else np.nan,
-        "claim_weighted_paid_per_claim": cwppc,
-    }
-
-
-def compute_volatility_features(prov: pd.DataFrame) -> dict:
-    """Volatility of paid_t.
-    mean_abs_monthlyized_change_paid normalizes each consecutive diff by its
-    calendar gap so a jump across 3 months counts the same per month as a 1-month jump.
-    """
-    paid = prov["paid_t"].to_numpy(dtype=float)
-    clean = paid[~np.isnan(paid)]
-    mean_p = float(np.nanmean(clean)) if len(clean) else np.nan
-    std_p  = float(np.nanstd(clean, ddof=1)) if len(clean) > 1 else np.nan
-    cv = float(std_p / mean_p) if (mean_p and mean_p != 0 and not np.isnan(std_p)) else np.nan
-
-    values, gaps = _valid_obs_with_gaps(prov)
-    if len(values) > 1 and len(gaps):
-        safe_gaps = np.where(gaps <= 0, 1.0, gaps)
-        mean_abs_monthlyized = float(np.mean(np.abs(np.diff(values)) / safe_gaps))
-    else:
-        mean_abs_monthlyized = np.nan
-
-    return {
-        "cv_paid":                          cv,
-        "mad_paid":                         _mad(paid),
-        "mean_abs_monthlyized_change_paid": mean_abs_monthlyized,
-    }
-
-
-def compute_spike_drop_features(prov: pd.DataFrame) -> dict:
-    """Spike, drop, and growth features; all change metrics are gap-aware (monthlyized).
-    max_monthlyized_paid_growth: pct growth rate per month; pairs where prior < MOM_MIN_DENOMINATOR are skipped.
-    largest_monthlyized_paid_drop = max(-adj_diff_i for negative monthlyized diffs)
-    """
-    paid = prov["paid_t"].to_numpy(dtype=float)
-    clean = paid[~np.isnan(paid)]
-
-    if len(clean) == 0:
+def family_history_support(prov: pd.DataFrame) -> dict:
+    """History and panel-support features — computed ONCE per provider, not per column."""
+    months = prov["month"].sort_values().dropna().reset_index(drop=True)
+    n = len(months)
+    if n == 0:
         return {
-            "spike_ratio_paid":              np.nan,
-            "max_monthlyized_paid_growth":   np.nan,
-            "largest_monthlyized_paid_drop": np.nan,
+            "months_observed": 0, "first_month": None, "last_month": None,
+            "span_months": np.nan, "missing_months_within_span": np.nan,
+            "fraction_months_observed": np.nan,
+            "mean_gap_months": np.nan, "max_gap_months": np.nan,
+        }
+    m_int = months.to_numpy(dtype="datetime64[M]").astype(int)
+    span  = int(m_int[-1] - m_int[0]) + 1
+    gaps  = np.diff(m_int).astype(float) if n > 1 else np.array([], dtype=float)
+    return {
+        "months_observed":            n,
+        "first_month":                str(months.iloc[0])[:7],
+        "last_month":                 str(months.iloc[-1])[:7],
+        "span_months":                span,
+        "missing_months_within_span": span - n,
+        "fraction_months_observed":   float(n / span) if span > 0 else np.nan,
+        "mean_gap_months":            float(gaps.mean()) if len(gaps) else np.nan,
+        "max_gap_months":             float(gaps.max())  if len(gaps) else np.nan,
+    }
+
+
+def family_summary(col: str, values: np.ndarray) -> dict:
+    """Summary statistics for one monthly signal.  Applies to ALL numeric columns.
+    x_sum emitted only for ADDITIVE_COLUMNS.
+    """
+    if len(values) < _MIN_OBS_SUMMARY:
+        out = {f"{col}_{s}": np.nan
+               for s in ("mean", "median", "std", "min", "max", "q25", "q75", "iqr")}
+        if col in ADDITIVE_COLUMNS:
+            out[f"{col}_sum"] = np.nan
+        return out
+    q25, q75 = np.percentile(values, [25, 75])
+    out = {
+        f"{col}_mean":   float(np.mean(values)),
+        f"{col}_median": float(np.median(values)),
+        f"{col}_std":    float(np.std(values, ddof=1)) if len(values) > 1 else np.nan,
+        f"{col}_min":    float(np.min(values)),
+        f"{col}_max":    float(np.max(values)),
+        f"{col}_q25":    float(q25),
+        f"{col}_q75":    float(q75),
+        f"{col}_iqr":    float(q75 - q25),
+    }
+    if col in ADDITIVE_COLUMNS:
+        out[f"{col}_sum"] = float(np.sum(values))
+    return out
+
+
+def family_gap_aware_change(col: str, values: np.ndarray, gaps: np.ndarray) -> dict:
+    """Gap-aware change and variability features.  Applies to ALL numeric columns.
+
+    Change metrics divide each consecutive diff by its calendar-month gap so that
+    a 3-month gap counts the same per month as a 1-month gap.
+    """
+    n  = len(values)
+    slope = np.nan
+    if n >= _MIN_OBS_SLOPE:
+        s, *_ = stats.linregress(np.arange(n, dtype=float), values)
+        slope = float(s)
+
+    mean_v = float(np.mean(values)) if n >= 1 else np.nan
+    std_v  = float(np.std(values, ddof=1)) if n >= 2 else np.nan
+    cv = float(std_v / mean_v) if (n >= 2 and not np.isnan(std_v) and abs(mean_v) > _CV_MEAN_FLOOR) else np.nan
+
+    if n >= _MIN_OBS_CHANGE and len(gaps) > 0:
+        sg          = _safe_gaps(gaps)
+        abs_monthly = np.abs(np.diff(values)) / sg
+        mean_abs   = float(np.mean(abs_monthly))
+        median_abs = float(np.median(abs_monthly))
+        max_abs    = float(np.max(abs_monthly))
+    else:
+        mean_abs = median_abs = max_abs = np.nan
+
+    return {
+        f"{col}_slope":                         slope,
+        f"{col}_mad":                           _mad(values),
+        f"{col}_cv":                            cv,
+        f"{col}_mean_abs_monthlyized_change":   mean_abs,
+        f"{col}_median_abs_monthlyized_change": median_abs,
+        f"{col}_max_abs_monthlyized_change":    max_abs,
+    }
+
+
+def family_spike(col: str, values: np.ndarray, gaps: np.ndarray, is_signed: bool) -> dict:
+    """Spike, drop, and extreme-value features.  Applies to ALL numeric columns.
+
+    Ratio features (spike_ratio_max_to_*) are NaN for SIGNED_OR_MISMATCH_COLUMNS.
+    """
+    if len(values) < _MIN_OBS_CHANGE:
+        return {
+            f"{col}_spike_ratio_max_to_median":    np.nan,
+            f"{col}_spike_ratio_max_to_mean":      np.nan,
+            f"{col}_largest_monthlyized_increase": np.nan,
+            f"{col}_largest_monthlyized_decrease": np.nan,
+            f"{col}_max_abs_deviation_from_median": np.nan,
         }
 
-    median_p = float(np.nanmedian(clean))
-    spike_ratio = float(np.nanmax(clean) / median_p) if median_p > 0 else np.nan
+    median_v = float(np.median(values))
+    mean_v   = float(np.mean(values))
+    max_v    = float(np.max(values))
 
-    values, gaps = _valid_obs_with_gaps(prov)
-    if len(values) < 2 or not len(gaps):
-        return {
-            "spike_ratio_paid":              spike_ratio,
-            "max_monthlyized_paid_growth":   np.nan,
-            "largest_monthlyized_paid_drop": np.nan,
-        }
+    ratio_med  = (float(max_v / median_v) if not is_signed and abs(median_v) > _RATIO_FLOOR else np.nan)
+    ratio_mean = (float(max_v / mean_v)   if not is_signed and abs(mean_v)   > _RATIO_FLOOR else np.nan)
+    max_dev    = float(np.max(np.abs(values - median_v)))
 
-    safe_gaps = np.where(gaps <= 0, 1.0, gaps)
-    adj_diffs = np.diff(values) / safe_gaps
-
-    drops = -adj_diffs[adj_diffs < 0]
-    largest_monthlyized_drop = float(drops.max()) if len(drops) else 0.0
-
-    prior = values[:-1]
-    gate  = prior >= MOM_MIN_DENOMINATOR
-    if gate.any():
-        adj_pct = (values[1:][gate] - prior[gate]) / prior[gate] / safe_gaps[gate]
-        max_growth = float(np.max(adj_pct))
+    if len(gaps) > 0:
+        sg          = _safe_gaps(gaps)
+        monthlyized = np.diff(values) / sg
+        pos = monthlyized[monthlyized > 0]
+        neg = monthlyized[monthlyized < 0]
+        largest_inc = float(pos.max()) if len(pos) else 0.0
+        largest_dec = float(-neg.min()) if len(neg) else 0.0
     else:
-        max_growth = np.nan
+        largest_inc = largest_dec = np.nan
 
     return {
-        "spike_ratio_paid":              spike_ratio,
-        "max_monthlyized_paid_growth":   max_growth,
-        "largest_monthlyized_paid_drop": largest_monthlyized_drop,
+        f"{col}_spike_ratio_max_to_median":    ratio_med,
+        f"{col}_spike_ratio_max_to_mean":      ratio_mean,
+        f"{col}_largest_monthlyized_increase": largest_inc,
+        f"{col}_largest_monthlyized_decrease": largest_dec,
+        f"{col}_max_abs_deviation_from_median": max_dev,
     }
 
 
-def compute_changepoint_features(prov: pd.DataFrame) -> dict:
-    """PELT changepoint detection on the ordered observed paid_t sequence.
-    Operates on observed rows only; calendar gaps between rows are not modelled.
-    largest_level_shift_paid = abs(median(seg_{j+1}) - median(seg_j)) in dollars.
-    largest_relative_level_shift_paid = above / max(|pre_median|, 1).
+def family_pct_growth(col: str, values: np.ndarray, gaps: np.ndarray, prior_floor: float) -> dict:
+    """Percent-growth features.  Only applied to PCT_GROWTH_COLUMNS.
+
+    Pairs where the prior value is below prior_floor are skipped to avoid
+    near-zero blow-up.  NaN propagates naturally — no fillna(0).
     """
     empty = {
-        "changepoint_count_paid":            np.nan,
-        "largest_level_shift_paid":          np.nan,
-        "largest_relative_level_shift_paid": np.nan,
+        f"{col}_max_monthlyized_pct_growth":   np.nan,
+        f"{col}_largest_monthlyized_pct_drop": np.nan,
+    }
+    if len(values) < _MIN_OBS_CHANGE or len(gaps) == 0:
+        return empty
+    sg      = _safe_gaps(gaps)
+    prior   = values[:-1]
+    nxt     = values[1:]
+    gate    = prior >= prior_floor
+    if not gate.any():
+        return empty
+    pct     = (nxt[gate] - prior[gate]) / prior[gate] / sg[gate]
+    drops   = -pct[pct < 0]
+    return {
+        f"{col}_max_monthlyized_pct_growth":   float(np.max(pct)),
+        f"{col}_largest_monthlyized_pct_drop": float(drops.max()) if len(drops) else np.nan,
     }
 
-    if not RUPTURES_AVAILABLE:
-        return empty
 
-    values, _ = _valid_obs_with_gaps(prov)
-    if len(values) < CHANGEPOINT_MIN_OBS:
-        return empty
+def family_changepoint(col: str, values: np.ndarray, cfg_cp: dict) -> dict:
+    """PELT changepoint detection.  Applies to ALL numeric columns.
 
+    Operates on the observed sequence only; calendar gaps are not modelled.
+    NaN = detection could not run (ruptures unavailable or insufficient obs).
+    No fillna(0) — NaN propagates to downstream models.
+    """
+    empty = {
+        f"{col}_changepoint_count":            np.nan,
+        f"{col}_largest_level_shift":          np.nan,
+        f"{col}_largest_relative_level_shift": np.nan,
+    }
+    if not RUPTURES_AVAILABLE or len(values) < cfg_cp["min_obs"]:
+        return empty
     try:
-        model       = rpt.Pelt(model=CHANGEPOINT_MODEL, min_size=CHANGEPOINT_MIN_SIZE, jump=1).fit(values.reshape(-1, 1))
-        breakpoints = [b for b in model.predict(pen=CHANGEPOINT_PENALTY) if b < len(values)]
-        count       = len(breakpoints)
-
-        largest_abs_shift = 0.0
-        largest_rel_shift = 0.0
-        if breakpoints:
-            segs = [0] + breakpoints + [len(values)]
-            abs_shifts, rel_shifts = [], []
+        model = rpt.Pelt(
+            model=cfg_cp["model"], min_size=cfg_cp["min_size"], jump=1
+        ).fit(values.reshape(-1, 1))
+        bps = [b for b in model.predict(pen=cfg_cp["penalty"]) if b < len(values)]
+        largest_abs = largest_rel = 0.0
+        if bps:
+            segs = [0] + bps + [len(values)]
             for i in range(len(segs) - 2):
-                pre_med  = float(np.median(values[segs[i]:segs[i + 1]]))
-                post_med = float(np.median(values[segs[i + 1]:segs[i + 2]]))
-                a = abs(post_med - pre_med)
-                abs_shifts.append(a)
-                rel_shifts.append(a / max(abs(pre_med), 1.0))
-            largest_abs_shift = float(max(abs_shifts))
-            largest_rel_shift = float(max(rel_shifts))
+                pre  = float(np.median(values[segs[i]:segs[i + 1]]))
+                post = float(np.median(values[segs[i + 1]:segs[i + 2]]))
+                a = abs(post - pre)
+                largest_abs = max(largest_abs, a)
+                largest_rel = max(largest_rel, a / max(abs(pre), 1.0))
+        return {
+            f"{col}_changepoint_count":            len(bps),
+            f"{col}_largest_level_shift":          largest_abs,
+            f"{col}_largest_relative_level_shift": largest_rel,
+        }
     except Exception:
         return empty
 
-    return {
-        "changepoint_count_paid":            count,
-        "largest_level_shift_paid":          largest_abs_shift,
-        "largest_relative_level_shift_paid": largest_rel_shift,
-    }
 
+def family_flag(col: str, values: np.ndarray, cfg_flags: dict) -> dict:
+    """Rolling robust-z anomaly flags.  Applies to ALL numeric columns.
 
-def compute_flagged_month_features(prov: pd.DataFrame) -> dict:
-    """Flag anomalous months via rolling robust z-score.
-    Baseline is prior ROBUST_Z_WINDOW OBSERVED rows, not calendar months.
-    All counts refer to observed-row positions, not calendar continuity.
+    Rolling window is over OBSERVED rows (values already non-NaN), not calendar
+    months.  This matches the original behavior.
     """
-    paid     = prov["paid_t"].reset_index(drop=True)
-    robust_z = _rolling_robust_z(paid, ROBUST_Z_WINDOW)
-    flagged  = robust_z.abs() > ROBUST_Z_THRESHOLD
+    window    = cfg_flags["window_obs"]
+    threshold = cfg_flags["robust_z_threshold"]
+    last_k    = cfg_flags["last_k_observed"]
 
-    max_consec, cur = 0, 0
+    rz      = _rolling_robust_z(pd.Series(values), window)
+    flagged = rz.abs() > threshold
+
+    max_consec = cur = 0
     for f in flagged:
         if f:
             cur += 1
@@ -281,151 +343,144 @@ def compute_flagged_month_features(prov: pd.DataFrame) -> dict:
         else:
             cur = 0
 
-    n = len(flagged)
-    # Denominator is only the rows that were actually evaluated (past the warmup window).
-    evaluable = max(n - ROBUST_Z_WINDOW, 0)
-    # num_flagged_last_6_obs is NaN when fewer than FLAG_RECENT_MONTHS rows were evaluated,
-    # so it is not compared against providers with fuller history.
-    recent = int(flagged.iloc[-FLAG_RECENT_MONTHS:].sum()) if evaluable >= FLAG_RECENT_MONTHS else np.nan
+    n         = len(values)
+    evaluable = max(n - window, 0)
+    recent    = int(flagged.iloc[-last_k:].sum()) if evaluable >= last_k else np.nan
+    max_rz    = float(rz.abs().max()) if evaluable > 0 else np.nan
 
     return {
-        "num_flagged_months":          int(flagged.sum()),
-        "fraction_flagged_months":     float(flagged.sum() / evaluable) if evaluable > 0 else np.nan,
-        "num_flagged_last_6_obs":      recent,
-        "max_consecutive_flagged_obs": max_consec,
+        f"{col}_max_abs_robust_z":           max_rz,
+        f"{col}_num_flagged_months":          int(flagged.sum()),
+        f"{col}_fraction_flagged_months":     float(flagged.sum() / evaluable) if evaluable > 0 else np.nan,
+        f"{col}_num_flagged_last_k_obs":      recent,
+        f"{col}_max_consecutive_flagged_obs": max_consec,
     }
 
 
-def compute_code_mix_summary_features(prov: pd.DataFrame) -> dict:
-    """Code-mix summaries. Entropy/HHI change features are gap-aware (monthlyized).
-    Fraction features exclude NaN months from both numerator and denominator.
-    """
+def _null_block(col: str) -> dict:
+    """All-NaN feature block for a column that is absent from the input or has no valid obs."""
     out: dict = {}
-
-    # ── top-code paid share ────────────────────────────────────────────────────
-    if "top_code_paid_share" in prov.columns:
-        tcps = prov["top_code_paid_share"].to_numpy(dtype=float)
-        out["mean_top_code_paid_share"] = float(np.nanmean(tcps)) if _has_valid(tcps) else np.nan
-        out["max_top_code_paid_share"]  = float(np.nanmax(tcps))  if _has_valid(tcps) else np.nan
-    else:
-        out["mean_top_code_paid_share"] = np.nan
-        out["max_top_code_paid_share"]  = np.nan
-
-    # ── top-3 paid share ──────────────────────────────────────────────────────
-    if "top_3_code_paid_share" in prov.columns:
-        t3 = prov["top_3_code_paid_share"].to_numpy(dtype=float)
-        out["mean_top_3_code_paid_share"]       = float(np.nanmean(t3)) if _has_valid(t3) else np.nan
-        out["max_top_3_code_paid_share"]        = float(np.nanmax(t3))  if _has_valid(t3) else np.nan
-        out["fraction_months_top3_above_80pct"] = _nan_safe_frac(t3, t3 > TOP3_HIGH_THRESHOLD)
-    else:
-        out["mean_top_3_code_paid_share"]       = np.nan
-        out["max_top_3_code_paid_share"]        = np.nan
-        out["fraction_months_top3_above_80pct"] = np.nan
-
-    # ── entropy ────────────────────────────────────────────────────────────────
-    if "hcpcs_entropy" in prov.columns:
-        ent = prov["hcpcs_entropy"].to_numpy(dtype=float)
-        out["min_hcpcs_entropy"]  = float(np.nanmin(ent))  if _has_valid(ent) else np.nan
-        out["mean_hcpcs_entropy"] = float(np.nanmean(ent)) if _has_valid(ent) else np.nan
-
-        ent_vals, gaps = _valid_obs_with_gaps(prov, col="hcpcs_entropy")
-        if len(ent_vals) > 1 and len(gaps):
-            adj = np.abs(np.diff(ent_vals)) / np.where(gaps <= 0, 1.0, gaps)
-            out["max_monthlyized_entropy_change"]  = float(np.max(adj))
-            out["mean_monthlyized_entropy_change"] = float(np.mean(adj))
-            out["num_months_high_entropy_change"]  = int(np.sum(adj > HIGH_ENTROPY_CHANGE))
-        else:
-            out["max_monthlyized_entropy_change"]  = np.nan
-            out["mean_monthlyized_entropy_change"] = np.nan
-            out["num_months_high_entropy_change"]  = 0
-    else:
-        out.update({k: np.nan for k in (
-            "min_hcpcs_entropy", "mean_hcpcs_entropy",
-            "max_monthlyized_entropy_change", "mean_monthlyized_entropy_change",
-        )})
-        out["num_months_high_entropy_change"] = 0
-
-    # ── HHI ────────────────────────────────────────────────────────────────────
-    if "hcpcs_hhi" in prov.columns:
-        hhi = prov["hcpcs_hhi"].to_numpy(dtype=float)
-        out["mean_hcpcs_hhi"]                    = float(np.nanmean(hhi)) if _has_valid(hhi) else np.nan
-        out["max_hcpcs_hhi"]                     = float(np.nanmax(hhi))  if _has_valid(hhi) else np.nan
-        out["fraction_months_high_concentration"] = _nan_safe_frac(hhi, hhi > HIGH_CONCENTRATION_HHI)
-
-        hhi_vals, gaps = _valid_obs_with_gaps(prov, col="hcpcs_hhi")
-        if len(hhi_vals) > 1 and len(gaps):
-            adj = np.abs(np.diff(hhi_vals)) / np.where(gaps <= 0, 1.0, gaps)
-            out["max_monthlyized_hhi_change"]  = float(np.max(adj))
-            out["mean_monthlyized_hhi_change"] = float(np.mean(adj))
-            out["num_months_high_hhi_change"]  = int(np.sum(adj > HIGH_HHI_CHANGE))
-        else:
-            out["max_monthlyized_hhi_change"]  = np.nan
-            out["mean_monthlyized_hhi_change"] = np.nan
-            out["num_months_high_hhi_change"]  = 0
-    else:
-        out.update({k: np.nan for k in (
-            "mean_hcpcs_hhi", "max_hcpcs_hhi", "fraction_months_high_concentration",
-            "max_monthlyized_hhi_change", "mean_monthlyized_hhi_change",
-        )})
-        out["num_months_high_hhi_change"] = 0
-
+    for s in ("mean", "median", "std", "min", "max", "q25", "q75", "iqr"):
+        out[f"{col}_{s}"] = np.nan
+    if col in ADDITIVE_COLUMNS:
+        out[f"{col}_sum"] = np.nan
+    for s in ("slope", "mad", "cv",
+              "mean_abs_monthlyized_change", "median_abs_monthlyized_change",
+              "max_abs_monthlyized_change"):
+        out[f"{col}_{s}"] = np.nan
+    for s in ("spike_ratio_max_to_median", "spike_ratio_max_to_mean",
+              "largest_monthlyized_increase", "largest_monthlyized_decrease",
+              "max_abs_deviation_from_median"):
+        out[f"{col}_{s}"] = np.nan
+    if col in PCT_GROWTH_COLUMNS:
+        out[f"{col}_max_monthlyized_pct_growth"]   = np.nan
+        out[f"{col}_largest_monthlyized_pct_drop"] = np.nan
+    for s in ("changepoint_count", "largest_level_shift", "largest_relative_level_shift"):
+        out[f"{col}_{s}"] = np.nan
+    for s in ("max_abs_robust_z", "num_flagged_months", "fraction_flagged_months",
+              "num_flagged_last_k_obs", "max_consecutive_flagged_obs"):
+        out[f"{col}_{s}"] = np.nan
     return out
 
 
-def compute_code_diversity_features(prov: pd.DataFrame) -> dict:
-    """hcpcs_count_trend is slope per observed step (not per calendar month)."""
-    if "hcpcs_count_t" not in prov.columns:
-        return {k: np.nan for k in (
-            "mean_hcpcs_count", "max_hcpcs_count", "std_hcpcs_count",
-            "hcpcs_count_trend", "fraction_months_single_code",
-        )}
-
-    hc = prov["hcpcs_count_t"].to_numpy(dtype=float)
-    return {
-        "mean_hcpcs_count":            float(np.nanmean(hc)),
-        "max_hcpcs_count":             float(np.nanmax(hc))         if len(hc) else np.nan,
-        "std_hcpcs_count":             float(np.nanstd(hc, ddof=1)) if len(hc) > 1 else np.nan,
-        "hcpcs_count_trend":           _linear_slope(hc),
-        "fraction_months_single_code": _nan_safe_frac(hc, np.round(hc).astype(int) == 1),
-    }
-
-
 # ── Main collapse ──────────────────────────────────────────────────────────────
-def build_provider_level(df: pd.DataFrame, min_months: int = MIN_MONTHS_DEFAULT) -> pd.DataFrame:
-    """One row per provider with all feature groups.
-    All providers are kept; insufficient_history_flag=1 when months_active < min_months.
+def build_provider_level(
+    df: pd.DataFrame,
+    min_months: int = MIN_MONTHS_DEFAULT,
+) -> pd.DataFrame:
+    """One row per provider.
+
+    For each provider:
+      1. Compute history/support features once.
+      2. For each numeric monthly column in ALL_NUMERIC_COLUMNS that exists in df:
+         apply summary, gap_aware_change, spike, pct_growth (if eligible),
+         changepoint, and flag families.
+      3. Emit insufficient_history_flag.
+
+    Columns missing from df produce all-NaN blocks (via _null_block).
+    NaN is never imputed with 0 — undefined features stay NaN.
     """
     df = df.copy()
     df["month"] = pd.to_datetime(df["month"], errors="coerce")
     df = df.sort_values(["billing_provider_npi", "month"])
 
-    rows = []
+    cfg_cp      = _cfg["changepoints"]
+    cfg_flags   = _cfg["rolling_flags"]
+    prior_floor = _cfg["pct_growth_prior_floor"]
+
+    rows: list[dict] = []
     for npi, prov in df.groupby("billing_provider_npi", sort=False):
         prov = prov.sort_values("month").reset_index(drop=True)
         row: dict = {"billing_provider_npi": npi}
-        row.update(compute_volume_scale_features(prov))
-        row.update(compute_unit_economics_features(prov))
-        row.update(compute_volatility_features(prov))
-        row.update(compute_spike_drop_features(prov))
-        row.update(compute_changepoint_features(prov))
-        row.update(compute_flagged_month_features(prov))
-        row.update(compute_code_mix_summary_features(prov))
-        row.update(compute_code_diversity_features(prov))
-        row["insufficient_history_flag"] = int(row["months_active"] < min_months)
+
+        # ── 1. History support (once per provider) ──────────────────────────
+        row.update(family_history_support(prov))
+
+        # ── 2. Feature families per numeric monthly column ──────────────────
+        for col in ALL_NUMERIC_COLUMNS:
+            if col not in prov.columns:
+                row.update(_null_block(col))
+                continue
+
+            values, gaps = _valid_obs_with_gaps(prov, col)
+
+            if len(values) == 0:
+                row.update(_null_block(col))
+                continue
+
+            is_signed = col in SIGNED_OR_MISMATCH_COLUMNS
+
+            row.update(family_summary(col, values))
+            row.update(family_gap_aware_change(col, values, gaps))
+            row.update(family_spike(col, values, gaps, is_signed))
+            if col in PCT_GROWTH_COLUMNS:
+                row.update(family_pct_growth(col, values, gaps, prior_floor))
+            row.update(family_changepoint(col, values, cfg_cp))
+            row.update(family_flag(col, values, cfg_flags))
+
+        row["insufficient_history_flag"] = int(row["months_observed"] < min_months)
         rows.append(row)
 
     return pd.DataFrame(rows).reset_index(drop=True)
 
 
-# ── Data dictionary ───────────────────────────────────────────────────────────
-_DICT_SOURCE = Path(__file__).parent / "provider_level_data_dictionary.json"
+# ── Data dictionary: loaded from external JSON ────────────────────────────────
+# Edit provider_level_data_dictionary.json to change definitions without touching code.
+_DEFAULT_DICT_JSON = Path(__file__).parent.parent / "provider_level_data_dictionary.json"
+
+DICTIONARY_ENTRY_KEYS = (
+    "column_name", "feature_group", "definition", "formula_or_logic",
+    "source_columns", "grain", "data_type", "missing_value_logic", "notes",
+)
 
 
-def build_data_dictionary(df: pd.DataFrame, source: Path = _DICT_SOURCE) -> list[dict]:
-    """Load dictionary from JSON, validate against df columns, return in df column order."""
-    with open(source, encoding="utf-8") as f:
-        entries = json.load(f)
-    dict_cols   = {e["column_name"] for e in entries}
+def load_data_dictionary_metadata(json_path: str) -> list[dict]:
+    """Load and validate data dictionary entries from the JSON file."""
+    path = Path(json_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Data dictionary JSON not found: {json_path}. "
+            "Create it or pass a valid --dictionary-json path."
+        )
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"Data dictionary JSON must be an array; got {type(data).__name__}")
+    for i, entry in enumerate(data):
+        missing_keys = set(DICTIONARY_ENTRY_KEYS) - set(entry)
+        if missing_keys:
+            raise ValueError(
+                f"Entry at index {i} (column '{entry.get('column_name', '?')}') "
+                f"missing keys: {missing_keys}"
+            )
+    return data
+
+
+def build_data_dictionary(df: pd.DataFrame, json_path: str) -> pd.DataFrame:
+    """Load the data dictionary from JSON, validate against df columns, reorder to match df."""
+    meta     = load_data_dictionary_metadata(json_path)
+    dict_df  = pd.DataFrame(meta)
+    dict_cols   = set(dict_df["column_name"])
     actual_cols = set(df.columns)
     missing_in_dict = actual_cols - dict_cols
     extra_in_dict   = dict_cols - actual_cols
@@ -433,8 +488,9 @@ def build_data_dictionary(df: pd.DataFrame, source: Path = _DICT_SOURCE) -> list
         raise ValueError(f"Data dictionary missing entries for columns: {missing_in_dict}")
     if extra_in_dict:
         raise ValueError(f"Data dictionary has entries for columns not in output: {extra_in_dict}")
-    col_order = {col: i for i, col in enumerate(df.columns)}
-    return sorted(entries, key=lambda e: col_order[e["column_name"]])
+    order   = [c for c in df.columns if c in dict_df["column_name"].values]
+    dict_df = dict_df.set_index("column_name").loc[order].reset_index()
+    return dict_df
 
 
 # ── I/O ────────────────────────────────────────────────────────────────────────
@@ -443,8 +499,8 @@ def load_provider_month(path: str) -> pd.DataFrame:
     if not p.is_file():
         raise FileNotFoundError(f"Provider-month CSV not found: {path}")
     df = pd.read_csv(p, low_memory=False)
-    required = {"billing_provider_npi", "month", "paid_t", "claims_t", "paid_per_claim_t"}
-    missing = required - set(df.columns)
+    required = {"billing_provider_npi", "month", "paid_t"}
+    missing  = required - set(df.columns)
     if missing:
         raise ValueError(f"Input CSV missing required columns: {missing}")
     return df
@@ -454,13 +510,16 @@ def run(
     input_csv: str,
     output_csv: str = DEFAULT_OUTPUT_CSV,
     dictionary_csv: str = DEFAULT_DICTIONARY_CSV,
-    dictionary_json: Path = _DICT_SOURCE,
+    dictionary_json: str = str(_DEFAULT_DICT_JSON),
     min_months: int = MIN_MONTHS_DEFAULT,
     date_cutoff: str = DATE_CUTOFF,
     filter_output: bool = True,
 ) -> pd.DataFrame:
-    """Build features for ALL providers, then optionally filter output to months_active >= min_months.
-    Saves the provider-level CSV and a human-readable data dictionary CSV.
+    """Build features, load dictionary from JSON, save CSVs.
+
+    NaN is never imputed with 0 — undefined features propagate to the output.
+    The only hard filter applied is providers whose median paid_t == 0
+    (spike_ratio_max_to_median is NaN), which are degenerate for paid-based detection.
     """
     if not RUPTURES_AVAILABLE:
         print("Warning: ruptures not installed — changepoint features will be NaN.\n"
@@ -478,56 +537,52 @@ def run(
 
     n_insuf = int(provider_level["insufficient_history_flag"].sum())
     print(f"Providers built: {len(provider_level):,}  "
-          f"({n_insuf:,} with months_active < {min_months} → insufficient_history_flag=1)")
+          f"({n_insuf:,} with months_observed < {min_months} → insufficient_history_flag=1)")
 
     if filter_output:
         provider_level = provider_level[provider_level["insufficient_history_flag"] == 0].copy()
-        print(f"After output filter: {len(provider_level):,} providers retained.")
+        print(f"After history filter: {len(provider_level):,} providers retained.")
 
-    # Drop providers where median paid == 0 (spike_ratio_paid NaN) — not useful for paid-based detection
-    before = len(provider_level)
-    provider_level = provider_level[provider_level["spike_ratio_paid"].notna()].copy()
-    print(f"Dropped {before - len(provider_level):,} providers with median paid = 0.")
+    # Drop providers where median paid_t == 0 — degenerate for paid-based anomaly detection
+    spike_col = "paid_t_spike_ratio_max_to_median"
+    if spike_col in provider_level.columns:
+        before = len(provider_level)
+        provider_level = provider_level[provider_level[spike_col].notna()].copy()
+        print(f"Dropped {before - len(provider_level):,} providers with median paid_t = 0.")
 
-    # Impute changepoint shift columns with 0 (no changepoint detected = no shift)
-    provider_level["largest_level_shift_paid"] = provider_level["largest_level_shift_paid"].fillna(0)
-    provider_level["largest_relative_level_shift_paid"] = provider_level["largest_relative_level_shift_paid"].fillna(0)
-
-    # Impute variation features with 0 where NaN (all-identical values → no variation)
-    for col in ["cv_paid", "std_paid_per_claim", "max_monthlyized_paid_growth"]:
-        if col in provider_level.columns:
-            provider_level[col] = provider_level[col].fillna(0)
-
-    # Condense cohort_label (same for all months per provider) — place as second column
+    # ── Condense cohort_label (first value per provider) ─────────────────────
     if "cohort_label" in df.columns:
         npi_cohort = df.groupby("billing_provider_npi")["cohort_label"].first().reset_index()
         provider_level = provider_level.merge(npi_cohort, on="billing_provider_npi", how="left")
-        cols = ["billing_provider_npi", "cohort_label"] + [c for c in provider_level.columns if c not in ("billing_provider_npi", "cohort_label")]
+        cols = ["billing_provider_npi", "cohort_label"] + [
+            c for c in provider_level.columns
+            if c not in ("billing_provider_npi", "cohort_label")
+        ]
         provider_level = provider_level[cols]
 
-    # Condense label from provider-month (all months share the same label per provider)
+    # ── Condense label (max per provider — 1 if ever excluded) ───────────────
     if "label" in df.columns:
         npi_label = df.groupby("billing_provider_npi")["label"].max().reset_index()
         provider_level = provider_level.merge(npi_label, on="billing_provider_npi", how="left")
-        n_positive = int((provider_level["label"] == 1).sum())
-        print(f"Labels condensed: {n_positive:,} providers with label=1.")
+        print(f"Labels condensed: {int((provider_level['label'] == 1).sum()):,} providers with label=1.")
     else:
         provider_level["label"] = float("nan")
 
-    # Save CSV
+    # ── Save provider-level CSV ───────────────────────────────────────────────
     out_path = Path(output_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     provider_level.to_csv(out_path, index=False)
     print(f"Output CSV:       {out_path.resolve()}")
+    print(f"Output shape:     {provider_level.shape}")
 
-    # Save data dictionary CSV (JSON source lives statically in scripts/)
-    data_dict = build_data_dictionary(provider_level, source=Path(dictionary_json))
+    # ── Load dictionary from JSON and validate against output columns ─────────
+    data_dict_df = build_data_dictionary(provider_level, dictionary_json)
     csv_path = Path(dictionary_csv)
     if not csv_path.is_absolute():
         csv_path = out_path.parent / csv_path
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(data_dict).to_csv(csv_path, index=False)
-    print(f"Dictionary CSV:   {csv_path.resolve()}")
+    data_dict_df.to_csv(csv_path, index=False)
+    print(f"Dictionary CSV:   {csv_path.resolve()}  ({len(data_dict_df):,} entries)")
 
     return provider_level
 
@@ -536,32 +591,31 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build provider-level anomaly detection features from a provider-month CSV."
     )
-    parser.add_argument("input_csv", help="Path to provider-month CSV.")
+    parser.add_argument("input_csv",
+                        help="Path to provider-month CSV.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_CSV,
                         help=f"Output CSV path (default: {DEFAULT_OUTPUT_CSV}).")
     parser.add_argument("--dictionary-csv", default=DEFAULT_DICTIONARY_CSV,
                         help=f"Output path for data dictionary CSV (default: {DEFAULT_DICTIONARY_CSV}).")
-    parser.add_argument("--dictionary-json", default=str(_DICT_SOURCE),
-                        help=f"Path to data dictionary JSON source (default: {_DICT_SOURCE}).")
+    parser.add_argument("--dictionary-json", default=str(_DEFAULT_DICT_JSON),
+                        help=f"Path to data dictionary JSON (default: {_DEFAULT_DICT_JSON}).")
     parser.add_argument("--min-months", type=int, default=MIN_MONTHS_DEFAULT,
                         help=f"Threshold for insufficient_history_flag (default: {MIN_MONTHS_DEFAULT}).")
     parser.add_argument("--date-cutoff", default=DATE_CUTOFF,
                         help=f"Exclude months after this date (default: {DATE_CUTOFF}).")
     parser.add_argument("--no-filter", action="store_true", default=False,
-                        help="Keep all providers in output regardless of months_active.")
+                        help="Keep all providers in output regardless of months_observed.")
     args = parser.parse_args()
 
     provider_level = run(
-        args.input_csv, args.output, args.dictionary_csv, args.dictionary_json,
+        args.input_csv, args.output, args.dictionary_csv,
+        args.dictionary_json,
         args.min_months, args.date_cutoff,
         filter_output=not args.no_filter,
     )
-
-    print(f"\nprovider_level shape: {provider_level.shape}")
-    print(f"Columns:              {list(provider_level.columns)}")
+    print(f"\nColumns ({len(provider_level.columns)}): {list(provider_level.columns)[:10]} ...")
     print(f"\nHead:\n{provider_level.head()}")
-    print(f"\nMissing value counts:\n{provider_level.isna().sum()}")
-    print(f"\nOutput: {Path(args.output).resolve()}")
+    print(f"\nMissing value counts (top 20):\n{provider_level.isna().sum().sort_values(ascending=False).head(20)}")
 
 
 if __name__ == "__main__":
