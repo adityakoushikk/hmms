@@ -250,6 +250,64 @@ def _hhi(probs: np.ndarray) -> float:
     return float(np.sum(p ** 2))
 
 
+def compute_beneficiary_proxy_features(
+    df: pd.DataFrame, provider_month_df: pd.DataFrame
+) -> pd.DataFrame:
+    """Add beneficiary-proxy columns to the provider-month table.
+
+    IMPORTANT — these are PROXY features, not true unique-beneficiary counts.
+    The raw data contains beneficiary counts at the provider × HCPCS × month grain.
+    Summing across HCPCS codes to reach provider-month level can double-count the
+    same beneficiary who appears under multiple codes.  All three output columns
+    carry the suffix ``_proxy`` to make this explicit.
+
+    Columns added
+    -------------
+    beneficiaries_proxy_t
+        Sum of beneficiary_count across all (provider, HCPCS, month) rows.
+        Over-counts shared beneficiaries; use only as a relative proxy.
+    claims_per_beneficiary_proxy_t
+        claims_t / beneficiaries_proxy_t.  NaN when beneficiaries_proxy_t <= 0.
+    paid_per_beneficiary_proxy_t
+        paid_t / beneficiaries_proxy_t.  NaN when beneficiaries_proxy_t <= 0.
+
+    If beneficiary_count is absent from the raw data, all three columns are NaN
+    and a warning is printed.
+    """
+    BENE_COL = "beneficiary_count"
+
+    if BENE_COL not in df.columns:
+        print(
+            f"Warning: source column '{BENE_COL}' not found in raw data — "
+            "beneficiary_proxy features will be NaN.",
+            file=sys.stderr,
+        )
+        out = provider_month_df.copy()
+        out["beneficiaries_proxy_t"] = np.nan
+        out["claims_per_beneficiary_proxy_t"] = np.nan
+        out["paid_per_beneficiary_proxy_t"] = np.nan
+        return out
+
+    bene_agg = (
+        df.groupby(["billing_provider_npi", "month"], dropna=False)[BENE_COL]
+        .sum()
+        .reset_index()
+        .rename(columns={BENE_COL: "beneficiaries_proxy_t"})
+    )
+
+    out = _merge_to_panel(provider_month_df, bene_agg)
+
+    # Ratio features: NaN-safe — zero or missing proxy denominator → NaN
+    valid = out["beneficiaries_proxy_t"] > 0
+    out["claims_per_beneficiary_proxy_t"] = np.where(
+        valid, out["claims_t"] / out["beneficiaries_proxy_t"], np.nan
+    )
+    out["paid_per_beneficiary_proxy_t"] = np.where(
+        valid, out["paid_t"] / out["beneficiaries_proxy_t"], np.nan
+    )
+    return out
+
+
 def compute_code_mix_features(
     code_level: pd.DataFrame, provider_month_df: pd.DataFrame
 ) -> pd.DataFrame:
@@ -290,11 +348,12 @@ def build_provider_month_df(
 ) -> pd.DataFrame:
     """
     Assemble provider_month_df: merge panel with core, then add ratio,
-    code-mix, and code-distribution features.
+    code-mix, and beneficiary-proxy features.
     """
     out = _merge_to_panel(panel, core)
     out = compute_ratio_features(out)
     out = compute_code_mix_features(code_level, out)
+    out = compute_beneficiary_proxy_features(raw_df, out)
 
     # Sort for reproducibility
     out = out.sort_values(["billing_provider_npi", "month"]).reset_index(drop=True)
@@ -405,6 +464,21 @@ def run(
     core = compute_core_monthly_aggregates(df)
     code_level = compute_code_level_totals(df)
     provider_month_df = build_provider_month_df(df, panel, core, code_level)
+
+    # Join cohort_label from cohort CSV so each row is tagged with its cohort
+    if cohort_csv is not None:
+        cohort_df = pd.read_csv(cohort_csv, dtype={"npi": str})[["npi", "cohort_label"]].drop_duplicates("npi")
+        provider_month_df["billing_provider_npi"] = provider_month_df["billing_provider_npi"].astype(str)
+        provider_month_df = provider_month_df.merge(
+            cohort_df.rename(columns={"npi": "billing_provider_npi"}),
+            on="billing_provider_npi", how="left"
+        )
+        # Move cohort_label to second column
+        cols = ["billing_provider_npi", "cohort_label"] + [c for c in provider_month_df.columns if c not in ("billing_provider_npi", "cohort_label")]
+        provider_month_df = provider_month_df[cols]
+        print(f"Cohort labels joined: {provider_month_df['cohort_label'].nunique()} distinct cohorts.")
+    else:
+        provider_month_df.insert(1, "cohort_label", None)
 
     # Join label and excldate from LEIE labels file (one row per NPI)
     if labels_csv is not None:

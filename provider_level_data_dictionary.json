@@ -11,6 +11,19 @@
     "notes": ""
   },
   {
+    "column_name": "cohort_label",
+    "feature_group": "identifier",
+    "definition": "Cohort identifier for the provider (e.g. NY_individual, CA_organization).",
+    "formula_or_logic": "Joined from provider_cohorts.csv on NPI.",
+    "source_columns": [
+      "cohort_label"
+    ],
+    "grain": "provider",
+    "data_type": "string",
+    "missing_value_logic": "None if cohort_csv not provided.",
+    "notes": "Allows filtering/grouping by cohort in downstream analysis."
+  },
+  {
     "column_name": "months_active",
     "feature_group": "volume",
     "definition": "Number of distinct observed months for this provider.",

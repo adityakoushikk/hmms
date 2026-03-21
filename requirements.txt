@@ -8,3 +8,5 @@ scikit-learn
 kmodes
 ruptures
 pyyaml
+keras
+tensorflow

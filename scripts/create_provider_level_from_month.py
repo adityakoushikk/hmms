@@ -498,6 +498,13 @@ def run(
         if col in provider_level.columns:
             provider_level[col] = provider_level[col].fillna(0)
 
+    # Condense cohort_label (same for all months per provider) — place as second column
+    if "cohort_label" in df.columns:
+        npi_cohort = df.groupby("billing_provider_npi")["cohort_label"].first().reset_index()
+        provider_level = provider_level.merge(npi_cohort, on="billing_provider_npi", how="left")
+        cols = ["billing_provider_npi", "cohort_label"] + [c for c in provider_level.columns if c not in ("billing_provider_npi", "cohort_label")]
+        provider_level = provider_level[cols]
+
     # Condense label from provider-month (all months share the same label per provider)
     if "label" in df.columns:
         npi_label = df.groupby("billing_provider_npi")["label"].max().reset_index()

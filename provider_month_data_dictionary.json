@@ -11,6 +11,19 @@
     "notes": ""
   },
   {
+    "column_name": "cohort_label",
+    "feature_group": "identifier",
+    "definition": "Cohort identifier for the provider (e.g. NY_individual, CA_organization).",
+    "formula_or_logic": "Joined from provider_cohorts.csv on NPI.",
+    "source_columns": [
+      "cohort_label"
+    ],
+    "grain": "provider-month (constant within provider)",
+    "data_type": "string",
+    "missing_value_logic": "None if cohort_csv not provided.",
+    "notes": "Allows filtering/grouping by cohort in downstream analysis."
+  },
+  {
     "column_name": "month",
     "feature_group": "time",
     "definition": "Calendar month (first day of month).",
@@ -108,6 +121,39 @@
     "data_type": "float",
     "missing_value_logic": "NaN if paid_t==0.",
     "notes": ""
+  },
+  {
+    "column_name": "beneficiaries_proxy_t",
+    "feature_group": "beneficiary_proxy",
+    "definition": "Sum of raw beneficiary_count across all (provider, HCPCS, month) rows. PROXY ONLY — not a true unique-beneficiary count. Summing across HCPCS codes can double-count beneficiaries who appear under multiple codes.",
+    "formula_or_logic": "sum(beneficiary_count) grouped by (billing_provider_npi, month).",
+    "source_columns": "beneficiary_count",
+    "grain": "provider-month",
+    "data_type": "float",
+    "missing_value_logic": "NaN if beneficiary_count column is absent from raw data.",
+    "notes": "Use only as a relative proxy. The _proxy suffix is intentional and must not be removed."
+  },
+  {
+    "column_name": "claims_per_beneficiary_proxy_t",
+    "feature_group": "beneficiary_proxy",
+    "definition": "Claims per beneficiary (proxy). PROXY ONLY — denominator is beneficiaries_proxy_t which over-counts shared beneficiaries.",
+    "formula_or_logic": "claims_t / beneficiaries_proxy_t. NaN if beneficiaries_proxy_t <= 0.",
+    "source_columns": "claims_t,beneficiary_count",
+    "grain": "provider-month",
+    "data_type": "float",
+    "missing_value_logic": "NaN if beneficiaries_proxy_t <= 0 or beneficiary_count absent.",
+    "notes": "Proxy ratio; interpret relative to peers, not as an absolute count."
+  },
+  {
+    "column_name": "paid_per_beneficiary_proxy_t",
+    "feature_group": "beneficiary_proxy",
+    "definition": "Paid per beneficiary (proxy). PROXY ONLY — denominator is beneficiaries_proxy_t which over-counts shared beneficiaries.",
+    "formula_or_logic": "paid_t / beneficiaries_proxy_t. NaN if beneficiaries_proxy_t <= 0.",
+    "source_columns": "paid_t,beneficiary_count",
+    "grain": "provider-month",
+    "data_type": "float",
+    "missing_value_logic": "NaN if beneficiaries_proxy_t <= 0 or beneficiary_count absent.",
+    "notes": "Proxy ratio; interpret relative to peers, not as an absolute dollar figure per patient."
   },
   {
     "column_name": "label",

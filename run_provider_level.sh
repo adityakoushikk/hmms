@@ -4,7 +4,7 @@
 set -e
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-INPUT_CSV="$REPO/data/outputs/provider_month_NY_individual.csv"
+INPUT_CSV="$REPO/data/outputs/provider_month.csv"
 OUTPUT_CSV="$REPO/data/outputs/provider_level.csv"
 DICTIONARY_CSV="$REPO/data/outputs/provider_level_data_dictionary.csv"
 DICTIONARY_JSON="$REPO/provider_level_data_dictionary.json"
