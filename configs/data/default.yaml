@@ -1,0 +1,60 @@
+defaults:
+  - splitter: none
+  - _self_
+
+_target_: anomaly_detect.data.anomaly_datamodule.AnomalyDataModule
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+# Path to the provider_month CSV (output of create_provider_month_dataset.py).
+# Should already be filtered to a single cohort if running cohort-by-cohort.
+provider_month_csv: ???
+
+# Cache path for the computed provider_level.csv.
+# null = auto-generate next to provider_month_csv as provider_level_{stem}.csv
+provider_level_csv: null
+
+# ── Provider-level feature creation subprocess params ─────────────────────────
+# These are passed to scripts/create_provider_level_from_month.py as CLI args.
+provider_level_script: ${paths.scripts_dir}/create_provider_level_from_month.py
+dictionary_json: ${paths.root_dir}/provider_level_data_dictionary.json
+min_months: 6
+date_cutoff: "2024-12-31"
+no_filter: false
+
+# ── Feature cleaning ──────────────────────────────────────────────────────────
+# Columns with NaN fraction > this threshold are dropped first;
+# then any remaining rows with NaN are dropped.
+nan_drop_threshold: 0.05
+
+# ── Feature selection ─────────────────────────────────────────────────────────
+feature_selection:
+  method: auroc             # auroc | none
+  auroc_threshold: 0.65
+  variance_min: null        # optional: drop near-zero variance features (e.g. 0.01)
+  corr_dedup_threshold: null # optional: drop correlated pairs (e.g. 0.95), keep higher-AUROC
+
+# ── Columns never used as model inputs ────────────────────────────────────────
+exclude_cols:
+  - label
+  - excldate
+  - billing_provider_npi
+  - insufficient_history_flag
+  - cohort_label
+  - months_observed
+  - first_month
+  - last_month
+  - span_months
+  - missing_months_within_span
+  - fraction_months_observed
+  - mean_gap_months
+  - max_gap_months
+
+# ── DataLoader ────────────────────────────────────────────────────────────────
+batch_size: 64
+num_workers: 0
+pin_memory: false
+scaler: standardize        # standardize | minmax | none
+
+# For autoencoder: only use label=0 providers in the training dataloader.
+# Has no effect on sklearn models (they use X_train_np/y_train_np directly).
+train_on_negatives: false
