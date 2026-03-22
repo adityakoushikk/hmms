@@ -3,7 +3,7 @@
 Usage
 -----
 ./run_anomaly.sh data.provider_month_csv=data/outputs/provider_month.csv
-./run_anomaly.sh data.provider_month_csv=data/outputs/provider_month.csv data.train_on_negatives=true
+./run_anomaly.sh data.provider_month_csv=data/outputs/provider_month.csv logger=csv
 """
 
 from __future__ import annotations
@@ -12,13 +12,11 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import wandb
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, open_dict
 
 import lightning.pytorch as L
-from lightning.pytorch.loggers import WandbLogger
 
 from anomaly_detect.data.anomaly_datamodule import AnomalyDataModule
 from anomaly_detect.models.anomaly_module import AnomalyLitModule
@@ -40,24 +38,26 @@ def train(cfg: DictConfig) -> dict:
     log.info(f"Features: {datamodule.n_features}")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    # input_dim is ??? in the config; patch it from the actual feature count
     with open_dict(cfg):
         cfg.model.net.input_dim = datamodule.n_features
 
     net = instantiate(cfg.model.net)
     lit = AnomalyLitModule(net=net, optimizer_cfg=cfg.model.optimizer)
 
-    # ── Logger & callbacks ────────────────────────────────────────────────
-    wandb_logger: Optional[WandbLogger] = None
-    if "logger" in cfg:
+    # ── Logger ────────────────────────────────────────────────────────────
+    logger = None
+    if cfg.get("logger"):
         try:
-            wandb_logger = instantiate(
-                cfg.logger,
-                name=cfg.task_name,
-                tags=list(cfg.get("tags", [])),
-            )
+            logger = instantiate(cfg.logger)
         except Exception as e:
-            log.warning(f"Could not init WANDB logger: {e}")
+            log.warning(f"Could not init logger: {e}")
+
+    # Check if this is a WandbLogger for wandb-specific extras
+    try:
+        from lightning.pytorch.loggers import WandbLogger
+        is_wandb = isinstance(logger, WandbLogger)
+    except ImportError:
+        is_wandb = False
 
     callbacks = instantiate_callbacks(cfg.get("callbacks", {}))
 
@@ -69,12 +69,12 @@ def train(cfg: DictConfig) -> dict:
     # ── Trainer ───────────────────────────────────────────────────────────
     trainer: L.Trainer = instantiate(
         cfg.trainer,
-        logger=wandb_logger if wandb_logger else False,
+        logger=logger if logger else False,
         callbacks=callbacks or None,
         default_root_dir=cfg.paths.output_dir,
     )
 
-    if wandb_logger:
+    if is_wandb:
         log_hyperparameters({"cfg": cfg, "model": lit, "trainer": trainer})
 
     trainer.fit(lit, datamodule)
@@ -89,9 +89,10 @@ def train(cfg: DictConfig) -> dict:
     )
     metrics["n_features"] = datamodule.n_features
 
-    if wandb_logger:
-        wandb_logger.experiment.log(metrics)
-        wandb_logger.experiment.log({
+    if is_wandb:
+        import wandb
+        logger.experiment.log(metrics)
+        logger.experiment.log({
             "top_500_providers": wandb.Table(dataframe=results_df.head(500))
         })
 

@@ -3,7 +3,7 @@ defaults:
   - data: default
   - model: autoencoder
   - trainer: default
-  - logger: wandb
+  - logger: csv
   - callbacks: default
   - hydra: default
   - _self_
