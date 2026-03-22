@@ -9,11 +9,7 @@ provider_level_features:
   # Raise this to require more history before including a provider in the output.
   min_months_observed: 6
 
-  # Minimum prior value before a pct-growth step is computed.
-  # Applies to PCT_GROWTH_COLUMNS only (paid_t, claims_t, ratio columns).
-  # Raise if huge pct-growth values appear from providers with tiny prior months.
-  # Note: same floor applied to all eligible columns; 10.0 is sensible for dollars
-  # and still harmless for claim counts / ratios.
+  # Avoid division by 0 when comoputing percent growth
   pct_growth_prior_floor: 10.0
 
   # Rolling robust-z anomaly flag settings.
