@@ -9,8 +9,9 @@ _target_: anomaly_detect.data.anomaly_datamodule.AnomalyDataModule
 # Should already be filtered to a single cohort if running cohort-by-cohort.
 provider_month_csv: ???
 
-# Output path for the computed provider_level.csv (always created fresh).
-provider_level_csv: ${paths.output_dir}/provider_level.csv
+# Path to an existing provider_level.csv to skip recomputation, or null to compute fresh.
+# null = auto-generate next to provider_month_csv as provider_level_{stem}.csv
+provider_level_csv: null
 
 # ── Provider-level feature creation subprocess params ─────────────────────────
 # These are passed to scripts/create_provider_level_from_month.py as CLI args.

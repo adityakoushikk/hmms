@@ -33,7 +33,30 @@ except ImportError:
 _CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
 
+#overridden at runtime when --config is passed from the Hydra pipeline.
+_DEFAULT_CONFIG: dict = {
+    "date_cutoff": "2024-12-31",
+    "provider_level_features": {
+        "min_months_observed": 6,
+        "pct_growth_prior_floor": 10.0,
+        "rolling_flags": {
+            "window_obs": 3,
+            "robust_z_threshold": 2.5,
+            "last_k_observed": 6,
+        },
+        "changepoints": {
+            "penalty": 2.0,
+            "model": "rbf",
+            "min_size": 3,
+            "min_obs": 6,
+        },
+    },
+}
+
+
 def _load_config(path: Path = _CONFIG_PATH) -> dict:
+    if not path.is_file():
+        return _DEFAULT_CONFIG
     with open(path) as f:
         return yaml.safe_load(f)
 
@@ -43,7 +66,7 @@ _cfg      = _cfg_root["provider_level_features"]
 
 DEFAULT_OUTPUT_CSV = "provider_level.csv"
 DATE_CUTOFF        = _cfg_root["date_cutoff"]
-MIN_MONTHS_DEFAULT     = _cfg["min_months_observed"]
+MIN_MONTHS_DEFAULT = _cfg["min_months_observed"]
 
 
 # ── Column eligibility ─────────────────────────────────────────────────────────

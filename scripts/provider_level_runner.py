@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 import yaml
+from omegaconf import OmegaConf
 
 
 def run_provider_level(
@@ -51,8 +52,9 @@ def run_provider_level(
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".yaml", delete=False, prefix="provider_level_cfg_"
         )
+        features_plain = OmegaConf.to_container(provider_level_features, resolve=True)
         yaml.dump(
-            {"date_cutoff": date_cutoff, "provider_level_features": dict(provider_level_features)},
+            {"date_cutoff": date_cutoff, "provider_level_features": features_plain},
             tmp,
         )
         tmp.flush()

@@ -46,9 +46,9 @@ class AnomalyDataModule(L.LightningDataModule):
     def __init__(
         self,
         provider_month_csv: str,
-        provider_level_csv: str,
         provider_level_script: str,
         splitter,
+        provider_level_csv: Optional[str] = None,
         min_months: int = 6,
         date_cutoff: str = "2024-12-31",
         no_filter: bool = False,
@@ -93,8 +93,17 @@ class AnomalyDataModule(L.LightningDataModule):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _get_or_compute_features(self) -> pd.DataFrame:
-        out = Path(self.hparams.provider_level_csv)
-        log.info(f"Running provider_level script → {out}")
+        if self.hparams.provider_level_csv:
+            out = Path(self.hparams.provider_level_csv)
+        else:
+            src = Path(self.hparams.provider_month_csv)
+            out = src.parent / f"provider_level_{src.stem}.csv"
+
+        if out.is_file():
+            log.info(f"Loading existing provider_level: {out}")
+            return pd.read_csv(out, low_memory=False)
+
+        log.info(f"Computing provider_level → {out}")
         run_provider_level(
             input_csv=self.hparams.provider_month_csv,
             output_csv=str(out),

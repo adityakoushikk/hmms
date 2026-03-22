@@ -43,3 +43,7 @@ wandb/
 
 # Subprojects
 acp-learn-model/
+
+# Stale Lightning/WANDB artifacts
+anomaly-detect/
+lightning_logs/

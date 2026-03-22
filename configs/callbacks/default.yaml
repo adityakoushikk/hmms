@@ -7,3 +7,12 @@ early_stopping:
   patience: 10
   mode: min
   verbose: false
+
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.output_dir}/checkpoints
+  monitor: val/loss
+  mode: min
+  save_top_k: 1
+  filename: best
+  verbose: false
