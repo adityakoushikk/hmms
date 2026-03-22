@@ -20,12 +20,16 @@ build/
 .DS_Store
 
 # Data files (large inputs/outputs — never commit)
-data/datasets/
-data/outputs/
+data/datasets/*
+data/outputs/*
 *.csv
 *.parquet
 *.xlsx
 *.xls
+
+# Keep directory structure visible on git
+!data/datasets/.gitkeep
+!data/outputs/.gitkeep
 
 # Dictionary files at repo root (tracked)
 !parameter_dictionary.csv
