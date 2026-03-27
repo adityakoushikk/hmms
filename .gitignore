@@ -56,3 +56,7 @@ acp-learn-model/
 # Stale Lightning/WANDB artifacts
 anomaly-detect/
 lightning_logs/
+
+# Anomaly report outputs
+anomalyReport/
+run_anomaly_report.sh
