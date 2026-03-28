@@ -6,9 +6,10 @@
 #   ./build_cohorts.sh
 #
 # Required inputs (override via environment if paths differ):
-#   MEDICAID_CSV  raw Medicaid billing CSV
-#   LEIE_CSV      LEIE exclusion list CSV
-#   NPPES_CSV     NPPES provider registry CSV
+#   MEDICAID_CSV      raw Medicaid billing CSV
+#   LEIE_CSV          LEIE exclusion list CSV
+#   NPPES_CSV         NPPES provider registry CSV
+#   REVOCATIONS_CSV   CMS revocations CSV
 
 set -e
 
@@ -18,6 +19,7 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 MEDICAID_CSV="${MEDICAID_CSV:-$REPO/data/datasets/medicaid-provider-spending.csv}"
 LEIE_CSV="${LEIE_CSV:-$REPO/data/datasets/LEIElabels.csv}"
 NPPES_CSV="${NPPES_CSV:-$REPO/data/datasets/nppes.csv}"
+REVOCATIONS_CSV="${REVOCATIONS_CSV:-$REPO/data/datasets/revocations.csv}"
 
 # ── Output paths ──────────────────────────────────────────────────────────────
 LABELS_CSV="$REPO/data/outputs/provider_labels.csv"
@@ -28,6 +30,7 @@ echo "=== Step 1/2: Building labels ==="
 python "$REPO/scripts/build_labels.py" \
   --leie_csv "$LEIE_CSV" \
   --medicaid_csv "$MEDICAID_CSV" \
+  --revocations_csv "$REVOCATIONS_CSV" \
   --output_csv "$LABELS_CSV"
 
 # ── Step 2: Cohorts ───────────────────────────────────────────────────────────

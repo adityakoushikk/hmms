@@ -376,7 +376,7 @@ def family_flag(col: str, values: np.ndarray, cfg_flags: dict) -> dict:
     }
 
 
-def _null_block(col: str) -> dict:
+def _null_block(col: str, quick_features: bool = False) -> dict:
     """All-NaN feature block for a column that is absent from the input or has no valid obs."""
     out: dict = {}
     for s in ("mean", "median", "std", "min", "max", "q25", "q75", "iqr"):
@@ -394,11 +394,12 @@ def _null_block(col: str) -> dict:
     if col in PCT_GROWTH_COLUMNS:
         out[f"{col}_max_monthlyized_pct_growth"]   = np.nan
         out[f"{col}_largest_monthlyized_pct_drop"] = np.nan
-    for s in ("changepoint_count", "largest_level_shift", "largest_relative_level_shift"):
-        out[f"{col}_{s}"] = np.nan
-    for s in ("max_abs_robust_z", "num_flagged_months", "fraction_flagged_months",
-              "num_flagged_last_k_obs", "max_consecutive_flagged_obs"):
-        out[f"{col}_{s}"] = np.nan
+    if not quick_features:
+        for s in ("changepoint_count", "largest_level_shift", "largest_relative_level_shift"):
+            out[f"{col}_{s}"] = np.nan
+        for s in ("max_abs_robust_z", "num_flagged_months", "fraction_flagged_months",
+                  "num_flagged_last_k_obs", "max_consecutive_flagged_obs"):
+            out[f"{col}_{s}"] = np.nan
     return out
 
 
@@ -406,6 +407,7 @@ def _null_block(col: str) -> dict:
 def build_provider_level(
     df: pd.DataFrame,
     min_months: int = MIN_MONTHS_DEFAULT,
+    quick_features: bool = False,
 ) -> pd.DataFrame:
     """One row per provider.
 
@@ -413,9 +415,11 @@ def build_provider_level(
       1. Compute history/support features once.
       2. For each numeric monthly column in ALL_NUMERIC_COLUMNS that exists in df:
          apply summary, gap_aware_change, spike, pct_growth (if eligible),
-         changepoint, and flag families.
+         and (unless quick_features=True) changepoint and flag families.
       3. Emit insufficient_history_flag.
 
+    quick_features=True skips PELT changepoints and rolling robust-z flags,
+    which dominate runtime. All other features are still computed.
     Columns missing from df produce all-NaN blocks (via _null_block).
     NaN is never imputed with 0 — undefined features stay NaN.
     """
@@ -426,6 +430,9 @@ def build_provider_level(
     cfg_cp      = _cfg["changepoints"]
     cfg_flags   = _cfg["rolling_flags"]
     prior_floor = _cfg["pct_growth_prior_floor"]
+
+    if quick_features:
+        print("quick_features=True: skipping changepoint and rolling-flag families.")
 
     rows: list[dict] = []
     for npi, prov in df.groupby("billing_provider_npi", sort=False):
@@ -438,13 +445,13 @@ def build_provider_level(
         # ── 2. Feature families per numeric monthly column ──────────────────
         for col in ALL_NUMERIC_COLUMNS:
             if col not in prov.columns:
-                row.update(_null_block(col))
+                row.update(_null_block(col, quick_features=quick_features))
                 continue
 
             values, gaps = _valid_obs_with_gaps(prov, col)
 
             if len(values) == 0:
-                row.update(_null_block(col))
+                row.update(_null_block(col, quick_features=quick_features))
                 continue
 
             is_signed = col in SIGNED_OR_MISMATCH_COLUMNS
@@ -454,8 +461,9 @@ def build_provider_level(
             row.update(family_spike(col, values, gaps, is_signed))
             if col in PCT_GROWTH_COLUMNS:
                 row.update(family_pct_growth(col, values, gaps, prior_floor))
-            row.update(family_changepoint(col, values, cfg_cp))
-            row.update(family_flag(col, values, cfg_flags))
+            if not quick_features:
+                row.update(family_changepoint(col, values, cfg_cp))
+                row.update(family_flag(col, values, cfg_flags))
 
         row["insufficient_history_flag"] = int(row["months_observed"] < min_months)
         rows.append(row)
@@ -482,6 +490,7 @@ def run(
     output_csv: str = DEFAULT_OUTPUT_CSV,
     min_months: int = MIN_MONTHS_DEFAULT,
     filter_output: bool = True,
+    quick_features: bool = False,
 ) -> pd.DataFrame:
     """Build provider-level features and save CSV.
 
@@ -497,7 +506,7 @@ def run(
     df = load_provider_month(input_csv)
     df["month"] = pd.to_datetime(df["month"], errors="coerce")
 
-    provider_level = build_provider_level(df, min_months=min_months)
+    provider_level = build_provider_level(df, min_months=min_months, quick_features=quick_features)
 
     n_insuf = int(provider_level["insufficient_history_flag"].sum())
     print(f"Providers built: {len(provider_level):,}  "
@@ -552,6 +561,8 @@ def main():
                         help=f"Threshold for insufficient_history_flag (default: {MIN_MONTHS_DEFAULT}).")
     parser.add_argument("--no-filter", action="store_true", default=False,
                         help="Keep all providers in output regardless of months_observed.")
+    parser.add_argument("--quick-features", action="store_true", default=False,
+                        help="Skip PELT changepoint and rolling robust-z flag families for faster runtime.")
     parser.add_argument("--config", default=None,
                         help="Override path to config.yaml (default: scripts/config.yaml). "
                              "Useful when called from the Hydra pipeline with a temp config.")
@@ -567,6 +578,7 @@ def main():
         args.input_csv, args.output,
         args.min_months,
         filter_output=not args.no_filter,
+        quick_features=args.quick_features,
     )
     print(f"\nColumns ({len(provider_level.columns)}): {list(provider_level.columns)[:10]} ...")
     print(f"\nHead:\n{provider_level.head()}")

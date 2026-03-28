@@ -103,7 +103,7 @@ pct     = (scored["anomaly_score"] < score).mean() * 100
 ERR_META     = {"billing_provider_npi", "anomaly_score", "label"}
 err_features = [c for c in feat_err.columns if c not in ERR_META]
 
-PM_META      = {"billing_provider_npi", "month", "label", "excldate"}
+PM_META      = {"billing_provider_npi", "month", "label", "excldate", "revocation_rsn"}
 pm_features  = [c for c in pm.columns if c not in PM_META]
 
 def map_to_pm_feature(pl_feat):
@@ -118,6 +118,13 @@ excldates = pd.to_datetime(
     _raw.astype(float).astype(int).astype(str), format="%Y%m%d", errors="coerce"
 ).dropna()
 excldate = excldates.iloc[0] if not excldates.empty else None
+
+_rev_raw = npi_pm["revocation_rsn"].dropna()
+revocation_rsn = str(_rev_raw.iloc[0]).strip() if not _rev_raw.empty else None
+if revocation_rsn:
+    with open(REPORT_DIR / "revocation_reason.txt", "w") as f:
+        f.write(revocation_rsn)
+    print(f"  Saved revocation_reason.txt")
 
 print(f"NPI: {TARGET_NPI}  |  score: {score:.4f}  |  label: {int(is_leie)}")
 

@@ -22,6 +22,7 @@ def run_provider_level(
     provider_level_script: str,
     min_months: int = 6,
     no_filter: bool = False,
+    quick_features: bool = False,
     provider_level_features: dict | None = None,
     python_exe: str | None = None,
 ) -> str:
@@ -43,6 +44,8 @@ def run_provider_level(
     ]
     if no_filter:
         cmd.append("--no-filter")
+    if quick_features:
+        cmd.append("--quick-features")
 
     # Write a temp config.yaml from Hydra params so the subprocess uses them
     # instead of the static scripts/config.yaml.

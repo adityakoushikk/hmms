@@ -58,3 +58,19 @@ class AnomalyLitModule(L.LightningModule):
             err = torch.mean(torch.abs(chunk - recon), dim=1)
             errors.append(err.cpu().numpy())
         return np.concatenate(errors)
+
+    @torch.no_grad()
+    def compute_feature_errors(
+        self, X: np.ndarray, batch_size: int = 512
+    ) -> np.ndarray:
+        """Per-feature absolute reconstruction error, shape (n_providers, n_features)."""
+        self.eval()
+        device = next(self.net.parameters()).device
+        X_t = torch.tensor(X, dtype=torch.float32)
+        errors = []
+        for start in range(0, len(X_t), batch_size):
+            chunk = X_t[start: start + batch_size].to(device)
+            recon = self.net(chunk)
+            err = torch.abs(chunk - recon)
+            errors.append(err.cpu().numpy())
+        return np.concatenate(errors)

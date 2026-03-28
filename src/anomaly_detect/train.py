@@ -12,6 +12,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, open_dict
@@ -103,6 +105,14 @@ def train(cfg: DictConfig) -> dict:
 
     results_df.to_csv(out_dir / "scored_providers.csv", index=False)
     log.info(f"Scored providers → {out_dir / 'scored_providers.csv'}")
+
+    feat_errors = lit.compute_feature_errors(datamodule.X_all_np)
+    feat_err_df = pd.DataFrame(feat_errors, columns=datamodule.feature_names)
+    feat_err_df.insert(0, "billing_provider_npi", datamodule.npis_all)
+    feat_err_df.insert(1, "anomaly_score", scores)
+    feat_err_df.insert(2, "label", datamodule.y_all_np)
+    feat_err_df.to_csv(out_dir / "provider_feature_errors.csv", index=False)
+    log.info(f"Feature errors → {out_dir / 'provider_feature_errors.csv'}")
 
     if datamodule.auroc_df is not None:
         datamodule.auroc_df.to_csv(out_dir / "feature_auroc.csv", index=False)

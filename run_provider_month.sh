@@ -26,12 +26,12 @@ DATE_END="${3:-}"
 
 # ── Input paths ───────────────────────────────────────────────────────────────
 MEDICAID_CSV="${MEDICAID_CSV:-$REPO/data/datasets/medicaid-provider-spending.csv}"
-LABELS_CSV="$REPO/data/outputs/provider_labels.csv"
-COHORTS_CSV="$REPO/data/outputs/provider_cohorts.csv"
+LABELS_CSV="${LABELS_CSV:-$REPO/data/datasets/provider_labels.csv}"
+COHORTS_CSV="${COHORTS_CSV:-$REPO/data/datasets/provider_cohorts.csv}"
 
 # ── Validate prereqs ──────────────────────────────────────────────────────────
 if [ ! -f "$COHORTS_CSV" ] || [ ! -f "$LABELS_CSV" ]; then
-  echo "Error: $COHORTS_CSV or $LABELS_CSV not found. Run build_cohorts.sh first."
+  echo "Error: $COHORTS_CSV or $LABELS_CSV not found. Run build_cohorts_and_labels.sh first."
   exit 1
 fi
 

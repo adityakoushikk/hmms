@@ -12,12 +12,14 @@ provider_month_csv: ???
 # Path to an existing provider_level.csv to skip recomputation, or null to compute fresh.
 # null = auto-generate next to provider_month_csv as provider_level_{stem}.csv
 provider_level_csv: null
+output_dir: ${paths.output_dir}
 
 # ── Provider-level feature creation subprocess params ─────────────────────────
 # These are passed to scripts/create_provider_level_from_month.py as CLI args.
 provider_level_script: ${paths.scripts_dir}/create_provider_level_from_month.py
 min_months: 6
 no_filter: false
+quick_features: false
 
 # ── Provider-level feature engineering (mirrors scripts/config.yaml) ──────────
 # A temp config.yaml is written from these values and passed to the subprocess,
@@ -26,11 +28,11 @@ provider_level_features:
   pct_growth_prior_floor: 10.0
   rolling_flags:
     window_obs: 3
-    robust_z_threshold: 2.5
+    robust_z_threshold: 2.0
     last_k_observed: 6
   changepoints:
-    penalty: 2.0
-    model: "rbf"
+    penalty: 4.0
+    model: "l1"
     min_size: 3
     min_obs: 6
 
@@ -40,14 +42,18 @@ provider_level_features:
 nan_drop_threshold: 0.05
 
 # ── Feature selection ─────────────────────────────────────────────────────────
-# Set auroc_threshold to null to disable filtering and use all features.
+# Set auroc_top_n to null to disable filtering and use all features.
 feature_selection:
-  auroc_threshold: 0.65
+  auroc_top_n: 50
+  unsupervised: false
+  const_threshold: 0.05
+  corr_threshold: 0.9
 
 # ── Columns never used as model inputs ────────────────────────────────────────
 exclude_cols:
   - label
   - excldate
+  - revocation_rsn
   - billing_provider_npi
   - insufficient_history_flag
   - cohort_label

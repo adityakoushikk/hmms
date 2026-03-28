@@ -347,16 +347,18 @@ def run(
 
     df = clean_raw_data(df)
 
+    if date_end is None:
+        date_end = "2024-12-31"
+        print(f"No --date-end specified; defaulting to {date_end}.")
     if date_start is not None:
         start_ts = pd.Timestamp(date_start)
         before = len(df)
         df = df[df["month"] >= start_ts]
         print(f"Date start {date_start}: {before - len(df):,} rows removed, {len(df):,} remaining.")
-    if date_end is not None:
-        end_ts = pd.Timestamp(date_end)
-        before = len(df)
-        df = df[df["month"] <= end_ts]
-        print(f"Date end {date_end}: {before - len(df):,} rows removed, {len(df):,} remaining.")
+    end_ts = pd.Timestamp(date_end)
+    before = len(df)
+    df = df[df["month"] <= end_ts]
+    print(f"Date end {date_end}: {before - len(df):,} rows removed, {len(df):,} remaining.")
     panel = build_provider_month_panel(df, BUILD_BALANCED_PANEL)
     core = compute_core_monthly_aggregates(df)
     code_level = compute_code_level_totals(df)
@@ -382,6 +384,7 @@ def run(
     else:
         provider_month_df["label"] = float("nan")
         provider_month_df["excldate"] = float("nan")
+        provider_month_df["revocation_rsn"] = float("nan")
 
     out_path = Path(output_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -417,7 +420,7 @@ def main():
     )
     parser.add_argument(
         "--date-end", default=None,
-        help="Exclude months after this date, e.g. 2024-12-31.",
+        help="Exclude months after this date, e.g. 2024-12-31. Defaults to 2024-12-31 if not set.",
     )
     args = parser.parse_args()
     run(args.input_csv, args.output, args.cohort_csv, args.cohort,

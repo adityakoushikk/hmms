@@ -49,8 +49,10 @@ class AnomalyDataModule(L.LightningDataModule):
         provider_level_script: str,
         splitter,
         provider_level_csv: Optional[str] = None,
+        output_dir: Optional[str] = None,
         min_months: int = 6,
         no_filter: bool = False,
+        quick_features: bool = False,
         provider_level_features: Optional[dict] = None,
         nan_drop_threshold: float = 0.05,
         feature_selection: Optional[dict] = None,
@@ -63,7 +65,7 @@ class AnomalyDataModule(L.LightningDataModule):
         super().__init__()
         self.save_hyperparameters(ignore=["splitter"])
         self.splitter = splitter
-        self.feature_selection = feature_selection or {"auroc_threshold": 0.65}
+        self.feature_selection = feature_selection or {"auroc_top_n": 50}
         self.exclude_cols = _ALWAYS_EXCLUDE | set(exclude_cols or [])
 
         # Populated during setup()
@@ -94,13 +96,14 @@ class AnomalyDataModule(L.LightningDataModule):
     def _get_or_compute_features(self) -> pd.DataFrame:
         if self.hparams.provider_level_csv:
             out = Path(self.hparams.provider_level_csv)
+            log.info(f"Loading existing provider_level: {out}")
+            return pd.read_csv(out, low_memory=False)
+
+        if self.hparams.output_dir:
+            out = Path(self.hparams.output_dir) / "provider_level.csv"
         else:
             src = Path(self.hparams.provider_month_csv)
             out = src.parent / f"provider_level_{src.stem}.csv"
-
-        if out.is_file():
-            log.info(f"Loading existing provider_level: {out}")
-            return pd.read_csv(out, low_memory=False)
 
         log.info(f"Computing provider_level → {out}")
         run_provider_level(
@@ -109,6 +112,7 @@ class AnomalyDataModule(L.LightningDataModule):
             provider_level_script=self.hparams.provider_level_script,
             min_months=self.hparams.min_months,
             no_filter=self.hparams.no_filter,
+            quick_features=self.hparams.quick_features,
             provider_level_features=self.hparams.provider_level_features,
         )
         return pd.read_csv(out, low_memory=False)
@@ -134,14 +138,42 @@ class AnomalyDataModule(L.LightningDataModule):
         log.info(f"After NaN row-drop: {len(df):,} rows (dropped {before - len(df):,})")
         return df.reset_index(drop=True)
 
-    def _select_features(self, X: pd.DataFrame, y: np.ndarray) -> List[str]:
-        """Select features by univariate AUROC threshold.
+    def _select_features_unsupervised(self, X: pd.DataFrame) -> List[str]:
+        """Drop near-constant then correlation-prune. No labels required."""
+        const_threshold = self.feature_selection.get("const_threshold", 0.01)
+        corr_threshold  = self.feature_selection.get("corr_threshold", 0.9)
 
-        If auroc_threshold is null in config, all features are kept and AUROC
-        is still computed (stored in auroc_df) but not used for filtering.
+        std = X.std(skipna=True)
+        drop_const = std[std < const_threshold].index.tolist()
+        X = X.drop(columns=drop_const)
+        log.info(f"Unsupervised: dropped {len(drop_const)} near-constant features (std < {const_threshold}) → {X.shape[1]} remain")
+
+        corr = X.corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        drop_corr = [col for col in upper.columns if any(upper[col] > corr_threshold)]
+        X = X.drop(columns=drop_corr)
+        log.info(f"Unsupervised: dropped {len(drop_corr)} correlated features (r > {corr_threshold}) → {X.shape[1]} remain")
+
+        return list(X.columns)
+
+    def _select_features(self, X: pd.DataFrame, y: np.ndarray) -> List[str]:
+        """Select features by AUROC threshold, or unsupervised if no labels or explicitly configured.
+
+        Unsupervised mode: drop near-constant features, then correlation-prune.
+        AUROC mode: filter by univariate roc_auc_score against exclusion labels.
+        Unsupervised is used automatically when no positive labels exist, or when
+        feature_selection.unsupervised=true is set in config.
         """
-        threshold = self.feature_selection.get("auroc_threshold")
-        if threshold is None:
+        use_unsupervised = self.feature_selection.get("unsupervised", False)
+        has_labels = len(np.unique(y)) >= 2
+
+        if use_unsupervised or not has_labels:
+            if not has_labels and not use_unsupervised:
+                log.warning("No positive labels found — falling back to unsupervised feature selection.")
+            return self._select_features_unsupervised(X)
+
+        top_n = self.feature_selection.get("auroc_top_n")
+        if top_n is None:
             log.info(f"Feature selection disabled — keeping all {len(X.columns)} features.")
             return list(X.columns)
 
@@ -163,8 +195,9 @@ class AnomalyDataModule(L.LightningDataModule):
             .sort_values("auroc", ascending=False)
             .reset_index(drop=True)
         )
-        selected = self.auroc_df[self.auroc_df["auroc"] >= threshold]["feature"].tolist()
-        log.info(f"AUROC >= {threshold}: {len(selected)} / {len(X.columns)} features selected.")
+        n = min(top_n, len(self.auroc_df))
+        selected = self.auroc_df["feature"].head(n).tolist()
+        log.info(f"Top {n} features by AUROC selected (out of {len(X.columns)}).")
         return selected
 
     def _fit_scale(self, X: np.ndarray, train_idx: np.ndarray) -> np.ndarray:
@@ -182,6 +215,8 @@ class AnomalyDataModule(L.LightningDataModule):
     # ── Lightning DataModule interface ────────────────────────────────────────
 
     def setup(self, stage: str = None) -> None:
+        if self._dataset is not None:
+            return  # already set up; Lightning calls this again inside trainer.fit()
         df = self._get_or_compute_features()
         df = self._clean_features(df)
 
